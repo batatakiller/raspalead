@@ -5,12 +5,12 @@ import threading
 import time
 import os
 import random
+import re
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 from playwright.sync_api import sync_playwright
 
 # --- Setup Constants and Directories ---
 DATA_DIR = "/app/data"
-# Fallback for local testing if /app/data doesn't exist and we're not in Docker
 if not os.path.exists(DATA_DIR) and not os.environ.get('DOCKER_CONTAINER'):
     DATA_DIR = "data"
     
@@ -30,21 +30,27 @@ def init_db():
             name TEXT,
             phone TEXT,
             website TEXT,
+            email TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(name, phone)
         )
     ''')
+    # Migração simples: adicionar coluna email se não existir
+    try:
+        c.execute('ALTER TABLE leads ADD COLUMN email TEXT')
+    except:
+        pass
     conn.commit()
     conn.close()
 
-def save_lead(name, phone, website):
+def save_lead(name, phone, website, email):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute('''
-            INSERT OR IGNORE INTO leads (name, phone, website)
-            VALUES (?, ?, ?)
-        ''', (name, phone, website))
+            INSERT OR IGNORE INTO leads (name, phone, website, email)
+            VALUES (?, ?, ?, ?)
+        ''', (name, phone, website, email))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -53,11 +59,11 @@ def save_lead(name, phone, website):
 def get_leads_df():
     try:
         conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query("SELECT id, name, phone, website, timestamp FROM leads ORDER BY timestamp DESC", conn)
+        df = pd.read_sql_query("SELECT id, name, phone, website, email, timestamp FROM leads ORDER BY timestamp DESC", conn)
         conn.close()
         return df
     except:
-        return pd.DataFrame(columns=["id", "name", "phone", "website", "timestamp"])
+        return pd.DataFrame(columns=["id", "name", "phone", "website", "email", "timestamp"])
 
 # --- Status Helper ---
 def update_status(msg):
@@ -70,11 +76,35 @@ def get_status():
             return f.read()
     return "Aguardando início..."
 
+# --- Email Extraction Helper ---
+def find_emails(text):
+    if not text: return []
+    return re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+
+def try_get_email_from_website(browser_context, url):
+    if not url or "http" not in url: return ""
+    try:
+        page = browser_context.new_page()
+        page.goto(url, timeout=10000, wait_until="domcontentloaded")
+        content = page.content()
+        emails = find_emails(content)
+        page.close()
+        if emails:
+            # Pegar o primeiro e-mail que não seja óbvio placeholder
+            for e in emails:
+                if "domain" not in e and "example" not in e:
+                    return e
+        return ""
+    except:
+        return ""
+
 # --- Playwright Scraper (Background Thread) ---
-def scrape_maps(search_term, proxy_url, stop_event):
+def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
     update_status("Iniciando navegador...")
     page = None
     browser = None
+    lead_count = 0
+    
     try:
         with sync_playwright() as p:
             browser_args = {
@@ -97,15 +127,10 @@ def scrape_maps(search_term, proxy_url, stop_event):
             page.wait_for_load_state("networkidle")
             time.sleep(random.uniform(2, 4))
             
-            # Aceitar cookies (se a janela aparecer na Europa/LGPD)
+            # Aceitar cookies
             try:
                 page.click("button:has-text('Rejeitar tudo'), button:has-text('Reject all')", timeout=3000)
-            except:
-                pass
-            try:
-                page.click("button:has-text('Aceitar tudo'), button:has-text('Accept all')", timeout=3000)
-            except:
-                pass
+            except: pass
             
             update_status(f"Buscando por: {search_term}")
             page.fill("input#searchboxinput", search_term)
@@ -113,30 +138,28 @@ def scrape_maps(search_term, proxy_url, stop_event):
             page.keyboard.press("Enter")
             
             update_status("Aguardando carregamento da lista...")
-            
-            # Tirar uma screenshot de debug assim que a tela de resultados tentar carregar
             page.wait_for_timeout(3000)
             page.screenshot(path=DEBUG_IMG_PATH)
             
-            # Espera até o painel "feed" com os resultados aparecer
-            page.wait_for_selector('div[role="feed"]', timeout=30000)
-            
+            try:
+                page.wait_for_selector('div[role="feed"]', timeout=30000)
+            except:
+                update_status("Painel de resultados não encontrado. Tente outro termo.")
+                return
+
             processed_names = set()
             scroll_attempts = 0
             
-            while not stop_event.is_set():
-                update_status("Carregando resultados...")
+            while not stop_event.is_set() and lead_count < max_leads:
+                update_status(f"Carregando resultados... ({lead_count}/{max_leads})")
                 page.wait_for_timeout(random.uniform(2000, 3000))
-                
-                # Screenshot contínuo de debug
                 page.screenshot(path=DEBUG_IMG_PATH)
 
-                # Busca os links dos itens listados
                 links = page.locator('a[href*="/maps/place/"]').element_handles()
-                new_links_processed = False
+                new_links_found = False
                 
                 for link in links:
-                    if stop_event.is_set():
+                    if stop_event.is_set() or lead_count >= max_leads:
                         break
                     
                     try:
@@ -144,109 +167,95 @@ def scrape_maps(search_term, proxy_url, stop_event):
                         if not name or name in processed_names:
                             continue
                         
-                        update_status(f"Extraindo: {name}")
-                        
-                        # Clica para abrir detalhes
+                        update_status(f"Extraindo: {name} ({lead_count+1}/{max_leads})")
                         link.scroll_into_view_if_needed()
-                        # Pequeno sleep antes do click para parecer humano
                         time.sleep(random.uniform(0.5, 1.5))
                         link.click()
-                        new_links_processed = True
+                        new_links_found = True
                         
-                        # Espera os detalhes carregarem
-                        page.wait_for_timeout(random.uniform(1500, 2500))
+                        # Espera detalhes
+                        page.wait_for_timeout(random.uniform(2000, 3000))
                         
                         phone = ""
                         website = ""
+                        email = ""
                         
-                        # Extrair telefone (variantes PT e EN)
+                        # Phone
                         try:
-                            # Utiliza regex para varrer botões de telefone
                             phone_locators = ['button[data-tooltip*="telefone"]', 'button[data-tooltip*="phone"]']
                             for sel in phone_locators:
                                 el = page.locator(sel).first
                                 if el.count() > 0:
-                                    # Muitas vezes o numero ta no aria-label 
                                     aria = el.get_attribute('aria-label')
                                     if aria:
                                         phone = aria.replace("Telefone:", "").replace("Phone:", "").strip()
                                         break
-                        except:
-                            pass
+                        except: pass
                         
-                        # Extrair site
+                        # Website
                         try:
                             web_locators = ['a[data-tooltip*="website"]', 'a[data-tooltip*="site"]']
                             for sel in web_locators:
                                 el = page.locator(sel).first
                                 if el.count() > 0:
                                     website = el.get_attribute("href")
-                                    if website:
-                                        break
-                        except:
-                            pass
-                            
-                        # Salvar no SQLite
-                        save_lead(name, phone, website)
-                        processed_names.add(name)
+                                    if website: break
+                        except: pass
                         
-                        # Volta o foco para o feed com um leve sleep
+                        # Email Extraction
+                        if extract_emails:
+                            # 1. Tenta achar na descrição visível do Maps
+                            details_text = page.locator('div[role="main"]').inner_text()
+                            emails_found = find_emails(details_text)
+                            if emails_found:
+                                email = emails_found[0]
+                            
+                            # 2. Se não achou e tem site, tenta visitar o site rapidamente
+                            if not email and website:
+                                update_status(f"Buscando e-mail no site de {name}...")
+                                email = try_get_email_from_website(context, website)
+                                update_status(f"Extraindo: {name} ({lead_count+1}/{max_leads})")
+
+                        save_lead(name, phone, website, email)
+                        processed_names.add(name)
+                        lead_count += 1
                         time.sleep(random.uniform(1, 2))
                         
                     except Exception as item_ex:
                         print(f"Erro item: {item_ex}")
-                        # Tirar screenshot se um erro de extração muito bizarro ocorrer
-                        page.screenshot(path=DEBUG_IMG_PATH)
                 
-                # Controle de Scroll para carregar mais itens
-                if new_links_processed:
-                    scroll_attempts = 0
-                else:
+                # Scroll
+                if not new_links_found:
                     scroll_attempts += 1
+                else:
+                    scroll_attempts = 0
                 
-                if scroll_attempts > 3:
-                     # Checar se atingimos o fim da lista
-                     content = page.content()
-                     if "Chegou ao fim da lista" in content or "reached the end of the list" in content:
-                         update_status("Fim da lista alcançado.")
-                         break
-                     
-                     if scroll_attempts > 6:
-                         update_status("Múltiplas tentativas de scroll sem novos itens. Parando.")
-                         break
+                if scroll_attempts > 5:
+                    break
                 
-                # Fazer o scroll do feed
-                update_status("Rolando a página para carregar mais...")
+                update_status("Rolando a página...")
                 page.mouse.wheel(0, 3000)
-                time.sleep(1)
+                time.sleep(2)
             
             if stop_event.is_set():
-                update_status("Extração cancelada pelo usuário.")
+                update_status(f"Cancelado. Capturados: {lead_count}")
+            elif lead_count >= max_leads:
+                update_status(f"Limite de {max_leads} atingido! ✅")
             else:
-                update_status("Extração Finalizada. ✅")
+                update_status(f"Fim dos resultados. Capturados: {lead_count} ✅")
                 
             browser.close()
             
     except Exception as e:
         update_status(f"Erro crítico: {str(e)}")
-        try:
-            if page:
-                page.screenshot(path=DEBUG_IMG_PATH)
-        except:
-            pass
-        if browser:
-            try:
-                browser.close()
-            except:
-                pass
+        if browser: browser.close()
     finally:
         st.session_state.is_running = False
 
 # --- UI Streamlit ---
 def main():
-    st.set_page_config(page_title="Maps Lead Scraper", page_icon="🗺️", layout="wide")
+    st.set_page_config(page_title="Maps Lead Scraper PRO", page_icon="🗺️", layout="wide")
     
-    # Initialize UI state
     if "is_running" not in st.session_state:
         st.session_state.is_running = False
     if "stop_event" not in st.session_state:
@@ -254,80 +263,61 @@ def main():
         
     init_db()
     
-    st.title("🗺️ Google Maps Lead Scraper")
-    st.markdown("Extraia leads diretamente do Google Maps via Playwright (Headless).")
+    st.title("🗺️ Google Maps Lead Scraper PRO")
     
     with st.sidebar:
         st.header("Configurações")
-        search_term = st.text_input("Termo de Busca:", placeholder="Ex: Arquitetos em São Paulo")
+        search_term = st.text_input("Busca:", placeholder="Ex: Dentistas em Curitiba")
+        
+        max_leads = st.number_input("Limite de Leads:", min_value=1, max_value=1000, value=50)
+        extract_emails = st.checkbox("Extrair E-mails (Lento - Visita sites)", value=False)
         
         st.markdown("---")
-        st.subheader("Configurações de Rede (VPS)")
-        st.markdown("Para evitar Captchas/Challenges do Google em Datacenters, insira um Proxy.")
-        proxy_url = st.text_input("URL Proxy Autenticado (Opcional):", placeholder="http://user:pass@ip:port")
+        st.subheader("Rede (VPS)")
+        proxy_url = st.text_input("Proxy (Opcional):", placeholder="http://user:pass@ip:port")
         
         st.markdown("---")
         if not st.session_state.is_running:
             if st.button("🚀 Iniciar Extração", type="primary", use_container_width=True):
                 if search_term:
-                    update_status("Preparando...")
+                    update_status("Iniciando...")
                     st.session_state.is_running = True
                     st.session_state.stop_event.clear()
-                    
-                    t = threading.Thread(target=scrape_maps, args=(search_term, proxy_url, st.session_state.stop_event))
+                    t = threading.Thread(target=scrape_maps, args=(search_term, proxy_url, max_leads, extract_emails, st.session_state.stop_event))
                     add_script_run_ctx(t)
                     t.start()
                     st.rerun()
                 else:
-                    st.warning("Preencha o termo de busca.")
+                    st.warning("Insira um termo.")
         else:
-            if st.button("⏹️ Parar Extração", type="secondary", use_container_width=True):
+            if st.button("⏹️ Parar Extração", use_container_width=True):
                 st.session_state.stop_event.set()
                 st.session_state.is_running = False
-                update_status("Cancelando a extração...")
                 st.rerun()
                 
-        st.markdown("---")
-        st.subheader("Ferramentas de Debug")
-        st.markdown("Caso as capturas parem, veja a tela do robô atual.")
-        if st.button("📸 Ver Screenshot de Debug"):
+        if st.button("📸 Screenshot de Debug"):
             if os.path.exists(DEBUG_IMG_PATH):
-                st.image(DEBUG_IMG_PATH, caption="Última visão do navegador")
-            else:
-                st.info("Nenhuma screenshot disponível ainda.")
+                st.image(DEBUG_IMG_PATH)
 
-    # Dashboard Principal
     col1, col2 = st.columns([3, 1])
     
     with col1:
-        st.subheader("Leads Capturados (Em Tempo Real)")
-        df_leads = get_leads_df()
-        st.dataframe(df_leads, use_container_width=True, height=400)
+        st.subheader("Resultados")
+        df = get_leads_df()
+        st.dataframe(df, use_container_width=True, height=450)
     
     with col2:
-        st.info("Status da Operação:\n\n**" + get_status() + "**")
+        st.info(f"**Status:**\n\n{get_status()}")
         
-        st.markdown("---")
-        st.markdown("### Exportação")
-        if not df_leads.empty:
-            # Generate Excel strictly in memory for download
-            output = pd.ExcelWriter(os.path.join(DATA_DIR, 'leads_export.xlsx'), engine='openpyxl')
-            df_leads.to_excel(output, index=False, sheet_name='Leads')
-            output.close()
-            
-            with open(os.path.join(DATA_DIR, 'leads_export.xlsx'), 'rb') as f:
-                st.download_button(
-                    label="📥 Baixar como Excel (.xlsx)",
-                    data=f,
-                    file_name="leads_export.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
-                )
+        if not df.empty:
+            output_file = os.path.join(DATA_DIR, 'leads_export.xlsx')
+            df.to_excel(output_file, index=False)
+            with open(output_file, 'rb') as f:
+                st.download_button("📥 Baixar Planilha (.xlsx)", data=f, file_name="leads_maps.xlsx", use_container_width=True)
                      
-        if st.button("🔄 Atualizar Tabela Manualmente"):
+        if st.button("🔄 Atualizar Tabela"):
             st.rerun()
 
-    # Auto-refresh loop when running
     if st.session_state.is_running:
         time.sleep(3)
         st.rerun()
