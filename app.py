@@ -120,31 +120,62 @@ def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
                 viewport={"width": 1920, "height": 1080},
                 locale="pt-BR"
             )
+            context.set_default_timeout(60000) # Aumentar timeout global para 60s
             page = context.new_page()
             
             update_status("Acessando Google Maps...")
-            page.goto("https://www.google.com/maps")
-            page.wait_for_load_state("networkidle")
-            time.sleep(random.uniform(2, 4))
+            page.goto("https://www.google.com/maps", wait_until="networkidle", timeout=90000)
+            time.sleep(random.uniform(3, 5))
             
-            # Aceitar cookies
-            try:
-                page.click("button:has-text('Rejeitar tudo'), button:has-text('Reject all')", timeout=3000)
-            except: pass
+            # Screenshot inicial para ver se há bloqueio/cookies
+            page.screenshot(path=DEBUG_IMG_PATH)
+
+            # Lógica reforçada para aceitar cookies/termos
+            update_status("Verificando banners de cookies...")
+            cookie_selectors = [
+                "button:has-text('Rejeitar tudo')", 
+                "button:has-text('Reject all')",
+                "button:has-text('Aceitar tudo')",
+                "button:has-text('Accept all')",
+                "button[aria-label*='Aceitar']",
+                "button[aria-label*='Accept']"
+            ]
+            for sel in cookie_selectors:
+                try:
+                    if page.locator(sel).is_visible():
+                        page.click(sel, timeout=5000)
+                        time.sleep(2)
+                except: pass
             
             update_status(f"Buscando por: {search_term}")
-            page.fill("input#searchboxinput", search_term)
-            time.sleep(random.uniform(1, 2))
-            page.keyboard.press("Enter")
+            # Esperar o campo de busca estar disponível
+            try:
+                page.wait_for_selector("input#searchboxinput", timeout=15000)
+                page.fill("input#searchboxinput", search_term)
+                time.sleep(random.uniform(1, 2))
+                page.keyboard.press("Enter")
+            except:
+                update_status("Campo de busca não encontrado. Google pode estar bloqueando ou mudou o layout.")
+                page.screenshot(path=DEBUG_IMG_PATH)
+                return
             
             update_status("Aguardando carregamento da lista...")
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)
             page.screenshot(path=DEBUG_IMG_PATH)
             
-            try:
-                page.wait_for_selector('div[role="feed"]', timeout=30000)
-            except:
-                update_status("Painel de resultados não encontrado. Tente outro termo.")
+            # Tentar múltiplos seletores para a lista de resultados
+            list_selectors = ['div[role="feed"]', 'div[aria-label*="Resultados"]', 'div[aria-label*="Results"]']
+            found_list = False
+            for sel in list_selectors:
+                try:
+                    page.wait_for_selector(sel, timeout=15000)
+                    found_list = True
+                    break
+                except: continue
+            
+            if not found_list:
+                update_status("Lista de resultados não apareceu (Timeout). Verifique o Screenshot de Debug.")
+                page.screenshot(path=DEBUG_IMG_PATH)
                 return
 
             processed_names = set()
