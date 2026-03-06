@@ -47,14 +47,36 @@ def save_lead(name, phone, website, email):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute('''
-            INSERT OR IGNORE INTO leads (name, phone, website, email)
-            VALUES (?, ?, ?, ?)
-        ''', (name, phone, website, email))
+        # Verificar se já existe
+        c.execute('SELECT email FROM leads WHERE name = ? AND phone = ?', (name, phone))
+        row = c.fetchone()
+        
+        if row:
+            # Se já existe mas o email novo é melhor (não estava preenchido)
+            if not row[0] and email:
+                c.execute('UPDATE leads SET email = ? WHERE name = ? AND phone = ?', (email, name, phone))
+        else:
+            # Se não existe, insere novo
+            c.execute('''
+                INSERT INTO leads (name, phone, website, email)
+                VALUES (?, ?, ?, ?)
+            ''', (name, phone, website, email))
+            
         conn.commit()
         conn.close()
     except Exception as e:
         print(f"DB Error: {e}")
+
+def lead_has_email(name, phone):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT email FROM leads WHERE name = ? AND phone = ?', (name, phone))
+        row = c.fetchone()
+        conn.close()
+        return row and row[0] is not None and len(row[0]) > 5
+    except:
+        return False
 
 def get_leads_df():
     try:
@@ -65,11 +87,14 @@ def get_leads_df():
     except:
         return pd.DataFrame(columns=["id", "name", "phone", "website", "email", "timestamp"])
 
-def lead_exists(name, phone):
+def lead_exists(name, phone=""):
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute('SELECT 1 FROM leads WHERE name = ? AND phone = ?', (name, phone))
+        if phone:
+            c.execute('SELECT 1 FROM leads WHERE name = ? AND phone = ?', (name, phone))
+        else:
+            c.execute('SELECT 1 FROM leads WHERE name = ?', (name,))
         exists = c.fetchone() is not None
         conn.close()
         return exists
@@ -90,7 +115,11 @@ def get_status():
 # --- Email Extraction Helper ---
 def find_emails(text):
     if not text: return []
-    return re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+    # Regex melhorada e busca em links mailto
+    emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+    # Limpeza básica (remover se terminar com extensões de imagem comuns capturadas por erro)
+    valid_emails = [e for e in emails if not e.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp'))]
+    return list(set(valid_emails))
 
 def try_get_email_from_website(browser_context, url):
     if not url or "http" not in url: return ""
@@ -256,13 +285,20 @@ def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
                         if not name:
                             continue
                         
-                        # Extrair telefone básico antes para checar duplicata no DB
-                        # (O Google Maps às vezes mostra o telefone no aria-label ou em elementos próximos)
-                        # Mas para ser preciso de verdade, precisamos clicar. 
-                        # Vamos otimizar: se o NOME já existe no set processed_names desta sessão, pular.
                         if name in processed_names:
                             continue
                             
+                        # --- NOVA LÓGICA DE DUPLICADOS ---
+                        # Se já existe no banco E já tem e-mail (ou o usuário não quer extrair e-mail), pular.
+                        # Se já existe mas falta e-mail e o usuário QUER e-mail, vamos processar para "completar".
+                        if lead_exists(name, ""): # Busca simplificada por nome
+                             if not extract_emails or lead_has_email(name, ""):
+                                update_status(f"Pulando {name} (Já existe)")
+                                processed_names.add(name)
+                                continue
+                             else:
+                                update_status(f"Lead {name} sem e-mail. Tentando completar...")
+                        
                         update_status(f"Verificando: {name}")
                         link.scroll_into_view_if_needed()
                         time.sleep(random.uniform(0.5, 1.5))
