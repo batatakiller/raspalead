@@ -83,19 +83,52 @@ def find_emails(text):
 
 def try_get_email_from_website(browser_context, url):
     if not url or "http" not in url: return ""
+    pages_to_visit = [url]
+    visited = set()
+    email_found = ""
+
     try:
+        # 1. Visitar a Home
         page = browser_context.new_page()
-        page.goto(url, timeout=10000, wait_until="domcontentloaded")
+        page.goto(url, timeout=15000, wait_until="domcontentloaded")
         content = page.content()
         emails = find_emails(content)
-        page.close()
+        
         if emails:
-            # Pegar o primeiro e-mail que não seja óbvio placeholder
-            for e in emails:
-                if "domain" not in e and "example" not in e:
-                    return e
-        return ""
+            email_found = next((e for e in emails if "domain" not in e and "example" not in e and ".png" not in e and ".jpg" not in e), "")
+        
+        # 2. Se não achou na home, procurar links de "Contato" ou "Sobre"
+        if not email_found:
+            links = page.locator('a').element_handles()
+            contact_keywords = ['contato', 'contact', 'fale conosco', 'about', 'sobre', 'empresa', 'quem somos']
+            
+            for link in links:
+                try:
+                    href = link.get_attribute('href')
+                    text = link.inner_text().lower()
+                    if href and any(kw in text or kw in href.lower() for kw in contact_keywords):
+                        full_url = href if "http" in href else f"{url.rstrip('/')}/{href.lstrip('/')}"
+                        if full_url not in visited:
+                            pages_to_visit.append(full_url)
+                            visited.add(full_url)
+                except: continue
+            
+            # Visitar até 2 subpáginas promissoras
+            for sub_url in pages_to_visit[1:3]:
+                if email_found: break
+                try:
+                    page.goto(sub_url, timeout=10000, wait_until="domcontentloaded")
+                    sub_content = page.content()
+                    sub_emails = find_emails(sub_content)
+                    if sub_emails:
+                        email_found = next((e for e in sub_emails if "domain" not in e and "example" not in e), "")
+                except: continue
+
+        page.close()
+        return email_found
     except:
+        try: page.close()
+        except: pass
         return ""
 
 # --- Playwright Scraper (Background Thread) ---
