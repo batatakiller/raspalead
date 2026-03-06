@@ -67,16 +67,31 @@ def save_lead(name, phone, website, email):
     except Exception as e:
         print(f"DB Error: {e}")
 
-def lead_has_email(name, phone):
+def check_lead_in_db(name):
+    """Verifica se o lead já existe no banco por nome. Retorna (exists, has_email)."""
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
-        c.execute('SELECT email FROM leads WHERE name = ? AND phone = ?', (name, phone))
+        c.execute('SELECT email FROM leads WHERE name = ?', (name,))
         row = c.fetchone()
         conn.close()
-        return row and row[0] is not None and len(row[0]) > 5
+        if row is None:
+            return False, False
+        has_email = row[0] is not None and len(str(row[0]).strip()) > 3
+        return True, has_email
     except:
-        return False
+        return False, False
+
+def update_lead_email(name, email):
+    """Atualiza o email de um lead existente."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('UPDATE leads SET email = ? WHERE name = ?', (email, name))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB Update Error: {e}")
 
 def get_leads_df():
     try:
@@ -87,19 +102,6 @@ def get_leads_df():
     except:
         return pd.DataFrame(columns=["id", "name", "phone", "website", "email", "timestamp"])
 
-def lead_exists(name, phone=""):
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        if phone:
-            c.execute('SELECT 1 FROM leads WHERE name = ? AND phone = ?', (name, phone))
-        else:
-            c.execute('SELECT 1 FROM leads WHERE name = ?', (name,))
-        exists = c.fetchone() is not None
-        conn.close()
-        return exists
-    except:
-        return False
 
 # --- Status Helper ---
 def update_status(msg):
@@ -123,51 +125,82 @@ def find_emails(text):
 
 def try_get_email_from_website(browser_context, url):
     if not url or "http" not in url: return ""
-    pages_to_visit = [url]
-    visited = set()
     email_found = ""
+    page = None
 
     try:
-        # 1. Visitar a Home
         page = browser_context.new_page()
-        page.goto(url, timeout=15000, wait_until="domcontentloaded")
+        page.goto(url, timeout=20000, wait_until="domcontentloaded")
+        time.sleep(2)
         content = page.content()
+        
+        # 1. Buscar links mailto: diretamente (mais confiável)
+        try:
+            mailto_links = page.locator('a[href^="mailto:"]').all()
+            for ml in mailto_links:
+                href = ml.get_attribute('href')
+                if href:
+                    email_found = href.replace('mailto:', '').split('?')[0].strip()
+                    if email_found and '@' in email_found:
+                        page.close()
+                        return email_found
+        except: pass
+        
+        # 2. Regex no conteúdo inteiro da página
         emails = find_emails(content)
-        
         if emails:
-            email_found = next((e for e in emails if "domain" not in e and "example" not in e and ".png" not in e and ".jpg" not in e), "")
+            good = [e for e in emails if 'domain' not in e and 'example' not in e and 'sentry' not in e and 'wixpress' not in e]
+            if good:
+                page.close()
+                return good[0]
         
-        # 2. Se não achou na home, procurar links de "Contato" ou "Sobre"
-        if not email_found:
-            links = page.locator('a').element_handles()
-            contact_keywords = ['contato', 'contact', 'fale conosco', 'about', 'sobre', 'empresa', 'quem somos']
-            
-            for link in links:
+        # 3. Se não achou na home, tentar páginas de contato
+        contact_keywords = ['contato', 'contact', 'fale', 'about', 'sobre', 'empresa', 'quem-somos']
+        sub_urls = []
+        try:
+            all_links = page.locator('a[href]').all()
+            for lnk in all_links[:50]:
                 try:
-                    href = link.get_attribute('href')
-                    text = link.inner_text().lower()
-                    if href and any(kw in text or kw in href.lower() for kw in contact_keywords):
-                        full_url = href if "http" in href else f"{url.rstrip('/')}/{href.lstrip('/')}"
-                        if full_url not in visited:
-                            pages_to_visit.append(full_url)
-                            visited.add(full_url)
+                    href = lnk.get_attribute('href') or ''
+                    text = (lnk.inner_text() or '').lower()
+                    if any(kw in text or kw in href.lower() for kw in contact_keywords):
+                        full = href if 'http' in href else f"{url.rstrip('/')}/{href.lstrip('/')}"
+                        if full not in sub_urls:
+                            sub_urls.append(full)
                 except: continue
-            
-            # Visitar até 2 subpáginas promissoras
-            for sub_url in pages_to_visit[1:3]:
-                if email_found: break
+        except: pass
+        
+        for sub_url in sub_urls[:3]:
+            if email_found: break
+            try:
+                page.goto(sub_url, timeout=12000, wait_until="domcontentloaded")
+                time.sleep(1)
+                
+                # Verificar mailto na subpágina
                 try:
-                    page.goto(sub_url, timeout=10000, wait_until="domcontentloaded")
+                    mailto_links = page.locator('a[href^="mailto:"]').all()
+                    for ml in mailto_links:
+                        href = ml.get_attribute('href')
+                        if href:
+                            email_found = href.replace('mailto:', '').split('?')[0].strip()
+                            if email_found and '@' in email_found:
+                                break
+                except: pass
+                
+                if not email_found:
                     sub_content = page.content()
                     sub_emails = find_emails(sub_content)
-                    if sub_emails:
-                        email_found = next((e for e in sub_emails if "domain" not in e and "example" not in e), "")
-                except: continue
+                    good = [e for e in sub_emails if 'domain' not in e and 'example' not in e and 'sentry' not in e]
+                    if good:
+                        email_found = good[0]
+            except: continue
 
         page.close()
         return email_found
-    except:
-        try: page.close()
+    except Exception as ex:
+        print(f"Email extraction error: {ex}")
+        try: 
+            if page: page.close()
         except: pass
         return ""
 
@@ -282,24 +315,27 @@ def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
                     
                     try:
                         name = link.get_attribute("aria-label")
-                        if not name:
+                        if not name or name in processed_names:
                             continue
                         
-                        if name in processed_names:
-                            continue
-                            
-                        # --- NOVA LÓGICA DE DUPLICADOS ---
-                        # Se já existe no banco E já tem e-mail (ou o usuário não quer extrair e-mail), pular.
-                        # Se já existe mas falta e-mail e o usuário QUER e-mail, vamos processar para "completar".
-                        if lead_exists(name, ""): # Busca simplificada por nome
-                             if not extract_emails or lead_has_email(name, ""):
-                                update_status(f"Pulando {name} (Já existe)")
-                                processed_names.add(name)
-                                continue
-                             else:
-                                update_status(f"Lead {name} sem e-mail. Tentando completar...")
+                        processed_names.add(name)
                         
-                        update_status(f"Verificando: {name}")
+                        # Verificar no banco de dados
+                        exists_in_db, has_email = check_lead_in_db(name)
+                        
+                        # Se já existe E (já tem email OU usuário não quer extrair emails), pular
+                        if exists_in_db and (has_email or not extract_emails):
+                            update_status(f"Pulando {name} (Já existe)")
+                            continue
+                        
+                        # Se já existe MAS falta email e o usuário quer emails
+                        needs_email_update = exists_in_db and not has_email and extract_emails
+                        
+                        if needs_email_update:
+                            update_status(f"Completando e-mail de: {name}")
+                        else:
+                            update_status(f"Extraindo: {name} ({lead_count+1}/{max_leads})")
+                        
                         link.scroll_into_view_if_needed()
                         time.sleep(random.uniform(0.5, 1.5))
                         link.click()
@@ -309,57 +345,58 @@ def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
                         page.wait_for_timeout(random.uniform(2000, 3000))
                         
                         phone = ""
-                        # Phone - Extração rápida para verificar se já existe no banco
+                        website = ""
+                        email = ""
+                        
+                        # Phone
                         try:
-                            phone_locators = ['button[data-tooltip*="telefone"]', 'button[data-tooltip*="phone"]']
+                            phone_locators = ['button[data-tooltip*="telefone"]', 'button[data-tooltip*="phone"]', 'a[data-tooltip*="telefone"]', 'a[data-tooltip*="phone"]']
                             for sel in phone_locators:
                                 el = page.locator(sel).first
                                 if el.count() > 0:
-                                    aria = el.get_attribute('aria-label')
+                                    aria = el.get_attribute('aria-label') or ""
                                     if aria:
                                         phone = aria.replace("Telefone:", "").replace("Phone:", "").strip()
                                         break
                         except: pass
-
-                        # --- NOVO: Verificar se o lead já consta no banco de dados ---
-                        if lead_exists(name, phone):
-                            update_status(f"Pulando {name} (Já existe no banco)")
-                            processed_names.add(name)
-                            # Não incrementamos o lead_count aqui para que ele continue buscando até completar o limite de NOVOS leads
-                            continue
-
-                        update_status(f"Extraindo: {name} ({lead_count+1}/{max_leads})")
-                        
-                        website = ""
-                        email = ""
                         
                         # Website
                         try:
-                            web_locators = ['a[data-tooltip*="website"]', 'a[data-tooltip*="site"]']
+                            web_locators = ['a[data-tooltip*="website"]', 'a[data-tooltip*="site"]', 'a[data-item-id="authority"]']
                             for sel in web_locators:
                                 el = page.locator(sel).first
                                 if el.count() > 0:
-                                    website = el.get_attribute("href")
+                                    website = el.get_attribute("href") or ""
                                     if website: break
                         except: pass
                         
                         # Email Extraction
                         if extract_emails:
                             # 1. Tenta achar na descrição visível do Maps
-                            details_text = page.locator('div[role="main"]').inner_text()
-                            emails_found = find_emails(details_text)
-                            if emails_found:
-                                email = emails_found[0]
+                            try:
+                                details_text = page.locator('div[role="main"]').inner_text()
+                                emails_found = find_emails(details_text)
+                                if emails_found:
+                                    email = emails_found[0]
+                            except: pass
                             
-                            # 2. Se não achou e tem site, tenta visitar o site rapidamente
+                            # 2. Se não achou e tem site, tenta visitar o site
                             if not email and website:
-                                update_status(f"Buscando e-mail no site de {name}...")
+                                update_status(f"🔍 Buscando e-mail no site de {name}...")
                                 email = try_get_email_from_website(context, website)
-                                update_status(f"Extraindo: {name} ({lead_count+1}/{max_leads})")
-
-                        save_lead(name, phone, website, email)
-                        processed_names.add(name)
-                        lead_count += 1
+                        
+                        # Salvar ou atualizar no banco
+                        if needs_email_update:
+                            if email:
+                                update_lead_email(name, email)
+                                update_status(f"✅ E-mail de {name} atualizado: {email}")
+                            else:
+                                update_status(f"❌ E-mail de {name} não encontrado")
+                        else:
+                            save_lead(name, phone, website, email)
+                            lead_count += 1
+                            update_status(f"✅ Lead {lead_count}/{max_leads}: {name} | {email or 'sem email'}")
+                        
                         time.sleep(random.uniform(1, 2))
                         
                     except Exception as item_ex:
