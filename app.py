@@ -289,25 +289,13 @@ def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
                         if lead_exists(name, phone):
                             update_status(f"Pulando {name} (Já existe no banco)")
                             processed_names.add(name)
+                            # Não incrementamos o lead_count aqui para que ele continue buscando até completar o limite de NOVOS leads
                             continue
 
                         update_status(f"Extraindo: {name} ({lead_count+1}/{max_leads})")
                         
-                        phone = ""
                         website = ""
                         email = ""
-                        
-                        # Phone
-                        try:
-                            phone_locators = ['button[data-tooltip*="telefone"]', 'button[data-tooltip*="phone"]']
-                            for sel in phone_locators:
-                                el = page.locator(sel).first
-                                if el.count() > 0:
-                                    aria = el.get_attribute('aria-label')
-                                    if aria:
-                                        phone = aria.replace("Telefone:", "").replace("Phone:", "").strip()
-                                        break
-                        except: pass
                         
                         # Website
                         try:
