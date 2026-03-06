@@ -65,6 +65,17 @@ def get_leads_df():
     except:
         return pd.DataFrame(columns=["id", "name", "phone", "website", "email", "timestamp"])
 
+def lead_exists(name, phone):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM leads WHERE name = ? AND phone = ?', (name, phone))
+        exists = c.fetchone() is not None
+        conn.close()
+        return exists
+    except:
+        return False
+
 # --- Status Helper ---
 def update_status(msg):
     with open(STATUS_FILE, "w") as f:
@@ -242,10 +253,17 @@ def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
                     
                     try:
                         name = link.get_attribute("aria-label")
-                        if not name or name in processed_names:
+                        if not name:
                             continue
                         
-                        update_status(f"Extraindo: {name} ({lead_count+1}/{max_leads})")
+                        # Extrair telefone básico antes para checar duplicata no DB
+                        # (O Google Maps às vezes mostra o telefone no aria-label ou em elementos próximos)
+                        # Mas para ser preciso de verdade, precisamos clicar. 
+                        # Vamos otimizar: se o NOME já existe no set processed_names desta sessão, pular.
+                        if name in processed_names:
+                            continue
+                            
+                        update_status(f"Verificando: {name}")
                         link.scroll_into_view_if_needed()
                         time.sleep(random.uniform(0.5, 1.5))
                         link.click()
@@ -253,6 +271,27 @@ def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
                         
                         # Espera detalhes
                         page.wait_for_timeout(random.uniform(2000, 3000))
+                        
+                        phone = ""
+                        # Phone - Extração rápida para verificar se já existe no banco
+                        try:
+                            phone_locators = ['button[data-tooltip*="telefone"]', 'button[data-tooltip*="phone"]']
+                            for sel in phone_locators:
+                                el = page.locator(sel).first
+                                if el.count() > 0:
+                                    aria = el.get_attribute('aria-label')
+                                    if aria:
+                                        phone = aria.replace("Telefone:", "").replace("Phone:", "").strip()
+                                        break
+                        except: pass
+
+                        # --- NOVO: Verificar se o lead já consta no banco de dados ---
+                        if lead_exists(name, phone):
+                            update_status(f"Pulando {name} (Já existe no banco)")
+                            processed_names.add(name)
+                            continue
+
+                        update_status(f"Extraindo: {name} ({lead_count+1}/{max_leads})")
                         
                         phone = ""
                         website = ""
