@@ -148,14 +148,28 @@ def scrape_maps(search_term, proxy_url, max_leads, extract_emails, stop_event):
                 except: pass
             
             update_status(f"Buscando por: {search_term}")
-            # Esperar o campo de busca estar disponível
-            try:
-                page.wait_for_selector("input#searchboxinput", timeout=15000)
-                page.fill("input#searchboxinput", search_term)
+            # Esperar o campo de busca estar disponível com múltiplos seletores
+            search_input = None
+            search_selectors = ["input#searchboxinput", "input.searchboxinput", "input[name='q']", "[name='q']", ".searchboxinput"]
+            
+            for sel in search_selectors:
+                try:
+                    update_status(f"Tentando seletor de busca: {sel}")
+                    search_input = page.wait_for_selector(sel, timeout=7000)
+                    if search_input:
+                        break
+                except:
+                    continue
+            
+            if search_input:
+                search_input.click()
+                time.sleep(random.uniform(0.5, 1.0))
+                # Usar fill para rapidez, mas garantir o foco
+                search_input.fill(search_term)
                 time.sleep(random.uniform(1, 2))
                 page.keyboard.press("Enter")
-            except:
-                update_status("Campo de busca não encontrado. Google pode estar bloqueando ou mudou o layout.")
+            else:
+                update_status("Campo de busca não encontrado (ID/Classe). Google pode estar mudando o DOM.")
                 page.screenshot(path=DEBUG_IMG_PATH)
                 return
             
